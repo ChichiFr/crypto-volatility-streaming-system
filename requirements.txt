@@ -1,0 +1,9 @@
+websocket-client==1.9.0
+kafka-python==2.3.0
+pyspark==4.1.1
+pandas
+numpy
+pyarrow
+xgboost
+scikit-learn
+streamlit

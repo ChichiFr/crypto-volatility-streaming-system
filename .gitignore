@@ -1,0 +1,17 @@
+.venv/
+.venv-wsl/
+__pycache__/
+*.py[cod]
+
+.vscode/
+.idea/
+
+*.log
+
+.env
+.env.*
+
+data/
+
+.DS_Store
+Thumbs.db
