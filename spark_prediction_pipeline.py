@@ -11,8 +11,21 @@ import time
 
 import numpy as np
 import pandas as pd
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json
+from pyspark.sql import SparkSession, Window
+from pyspark.sql.functions import (
+    avg,
+    col,
+    current_timestamp,
+    desc,
+    from_json,
+    lag,
+    log,
+    pandas_udf,
+    row_number,
+    stddev,
+    to_timestamp,
+    when,
+)
 from pyspark.sql.types import (
     DoubleType,
     LongType,
@@ -33,27 +46,18 @@ if hasattr(sys.stdout, "reconfigure"):
 OUTPUT_PATH = "data/predictions"
 METRICS_PATH = "data/metrics"
 CHECKPOINT_PATH = "/tmp/spark_checkpoint_predictions"
-HISTORY_COLUMNS = [
-    "timestamp",
-    "symbol",
-    "interval_start",
-    "open",
-    "high",
-    "low",
-    "close",
-    "volume",
-    "source",
-    "granularity",
-]
+HISTORY_PATH = "/tmp/crypto_raw_history"
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "crypto-stream")
 FEATURE_COLUMNS = [
-    "log_return",
-    "rolling_volatility_60",
-    "rolling_volatility_5",
-    "rolling_volatility_22",
-    "lag_1",
-    "lag_5",
-    "lag_22",
-    "roc",
+    "realized_vol_5",
+    "realized_vol_22",
+    "realized_vol_60",
+    "lag_1_vol",
+    "lag_5_vol",
+    "volume_rolling_mean",
+    "roc_5",
+    "roc_22",
 ]
 
 os.makedirs(OUTPUT_PATH, exist_ok=True)
@@ -114,6 +118,73 @@ with open("models/model_eth.pkl", "rb") as file_handle:
     print("ETH model loaded\n")
 
 
+@pandas_udf(DoubleType())
+def predict_volatility_udf(
+    symbol_series,
+    realized_vol_5_series,
+    realized_vol_22_series,
+    realized_vol_60_series,
+    lag_1_vol_series,
+    lag_5_vol_series,
+    volume_rolling_mean_series,
+    roc_5_series,
+    roc_22_series,
+):
+    predictions = []
+
+    for symbol, realized_vol_5, realized_vol_22, realized_vol_60, lag_1_vol, lag_5_vol, volume_rolling_mean, roc_5, roc_22 in zip(
+        symbol_series,
+        realized_vol_5_series,
+        realized_vol_22_series,
+        realized_vol_60_series,
+        lag_1_vol_series,
+        lag_5_vol_series,
+        volume_rolling_mean_series,
+        roc_5_series,
+        roc_22_series,
+    ):
+        if any(
+            pd.isna(value)
+            for value in [
+                realized_vol_5,
+                realized_vol_22,
+                realized_vol_60,
+                lag_1_vol,
+                lag_5_vol,
+                volume_rolling_mean,
+                roc_5,
+                roc_22,
+            ]
+        ):
+            predictions.append(None)
+            continue
+
+        features = np.array(
+            [
+                realized_vol_5,
+                realized_vol_22,
+                realized_vol_60,
+                lag_1_vol,
+                lag_5_vol,
+                volume_rolling_mean,
+                roc_5,
+                roc_22,
+            ],
+            dtype=np.float32,
+        ).reshape(1, -1)
+
+        if symbol == "BTC-USD":
+            pred = model_btc.predict(features)[0]
+        elif symbol == "ETH-USD":
+            pred = model_eth.predict(features)[0]
+        else:
+            pred = None
+
+        predictions.append(float(pred) if pred is not None else None)
+
+    return pd.Series(predictions)
+
+
 spark = (
     SparkSession.builder
     .appName("CryptoVolatilityPredictions")
@@ -140,31 +211,14 @@ input_schema = StructType([
     StructField("granularity", StringType(), True),
 ])
 
-output_schema = StructType([
-    StructField("prediction_timestamp", StringType(), True),
-    StructField("market_timestamp", StringType(), True),
-    StructField("symbol", StringType(), True),
-    StructField("interval_start", LongType(), True),
-    StructField("close", DoubleType(), True),
-    StructField("volume", DoubleType(), True),
-    StructField("predicted_volatility_60min", DoubleType(), True),
-    StructField("current_volatility", DoubleType(), True),
-    StructField("rolling_volatility_5", DoubleType(), True),
-    StructField("rolling_volatility_22", DoubleType(), True),
-    StructField("log_return", DoubleType(), True),
-    StructField("roc", DoubleType(), True),
-    StructField("latency_seconds", DoubleType(), True),
-    StructField("risk_signal", StringType(), True),
-])
-
 
 print("Connecting to Kafka...")
 
 kafka_df = (
     spark.readStream
     .format("kafka")
-    .option("kafka.bootstrap.servers", "localhost:9092")
-    .option("subscribe", "crypto-stream")
+    .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
+    .option("subscribe", KAFKA_TOPIC)
     .option("startingOffsets", "latest")
     .load()
 )
@@ -181,75 +235,13 @@ print("Prediction pipeline configured")
 print("=" * 80)
 print("REAL-TIME PREDICTIONS ACTIVE")
 print("=" * 80)
-print("Input: Kafka topic crypto-stream")
+print(f"Input: Kafka topic {KAFKA_TOPIC}")
 print("Model: XGBoost")
+print(f"Kafka Broker: {KAFKA_BOOTSTRAP_SERVERS}")
 print(f"Output: {OUTPUT_PATH}")
 print(f"Metrics: {METRICS_PATH}")
 print("Trigger: Every 10 seconds")
 print("=" * 80 + "\n")
-
-
-history_by_symbol = {}
-
-
-def compute_features(frame):
-    frame = frame.sort_values(["interval_start", "timestamp"]).copy()
-    numeric_columns = ["interval_start", "open", "high", "low", "close", "volume"]
-    for column in numeric_columns:
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-
-    frame["prev_close"] = frame["close"].shift(1)
-    frame["log_return"] = np.where(
-        frame["prev_close"].notna(),
-        np.log(frame["close"] / frame["prev_close"]),
-        np.nan,
-    )
-    frame["rolling_volatility_60"] = frame["log_return"].rolling(60, min_periods=60).std()
-    frame["rolling_volatility_5"] = frame["log_return"].rolling(5, min_periods=5).std()
-    frame["rolling_volatility_22"] = frame["log_return"].rolling(22, min_periods=22).std()
-    frame["lag_1"] = frame["close"].shift(1)
-    frame["lag_5"] = frame["close"].shift(5)
-    frame["lag_22"] = frame["close"].shift(22)
-    frame["roc"] = np.where(
-        frame["prev_close"].notna(),
-        (frame["close"] - frame["prev_close"]) / frame["prev_close"],
-        np.nan,
-    )
-    return frame
-
-
-def apply_model(frame, symbol):
-    feature_frame = frame[FEATURE_COLUMNS]
-
-    if feature_frame.isnull().any(axis=None):
-        frame["predicted_volatility_60min"] = np.nan
-        return frame
-
-    if symbol == "BTC-USD":
-        model = model_btc
-    elif symbol == "ETH-USD":
-        model = model_eth
-    else:
-        frame["predicted_volatility_60min"] = np.nan
-        return frame
-
-    try:
-        frame["predicted_volatility_60min"] = model.predict(feature_frame.to_numpy())
-    except Exception as error:
-        print(f"Prediction error for {symbol}: {error}")
-        frame["predicted_volatility_60min"] = np.nan
-
-    return frame
-
-
-def label_risk(prediction_value):
-    if pd.isna(prediction_value):
-        return None
-    if prediction_value > 0.02:
-        return "HIGH"
-    if prediction_value > 0.01:
-        return "MEDIUM"
-    return "LOW"
 
 
 def process_batch(batch_df, batch_id):
@@ -259,77 +251,125 @@ def process_batch(batch_df, batch_id):
         print(f"Batch {batch_id}: no rows")
         return
 
-    batch_pdf = batch_df.toPandas()
-    if batch_pdf.empty:
-        print(f"Batch {batch_id}: empty pandas batch")
-        return
+    batch_df = batch_df.withColumn("interval_start", col("interval_start").cast("long"))
+    batch_df = batch_df.withColumn("open", col("open").cast("double"))
+    batch_df = batch_df.withColumn("high", col("high").cast("double"))
+    batch_df = batch_df.withColumn("low", col("low").cast("double"))
+    batch_df = batch_df.withColumn("close", col("close").cast("double"))
+    batch_df = batch_df.withColumn("volume", col("volume").cast("double"))
+    current_batch_df = batch_df.select(*input_schema.fieldNames()).dropDuplicates(["symbol", "interval_start"])
+    current_keys_df = current_batch_df.select("symbol", "interval_start")
 
-    batch_pdf["interval_start"] = batch_pdf["interval_start"].astype("int64")
-    batch_pdf = batch_pdf.sort_values(["symbol", "interval_start", "timestamp"])
+    if os.path.exists(HISTORY_PATH):
+        history_df = batch_df.sparkSession.read.schema(input_schema).parquet(HISTORY_PATH)
+    else:
+        history_df = batch_df.sparkSession.createDataFrame([], input_schema)
 
-    output_frames = []
+    combined_df = history_df.unionByName(current_batch_df)
 
-    for symbol, symbol_batch in batch_pdf.groupby("symbol", sort=False):
-        history_pdf = history_by_symbol.get(symbol)
-        if history_pdf is None:
-            history_pdf = pd.DataFrame(columns=HISTORY_COLUMNS)
+    dedupe_window = Window.partitionBy("symbol", "interval_start").orderBy(desc("timestamp"))
+    combined_df = (
+        combined_df.withColumn("row_num", row_number().over(dedupe_window))
+        .where(col("row_num") == 1)
+        .drop("row_num")
+    )
 
-        combined_pdf = pd.concat(
-            [history_pdf, symbol_batch[HISTORY_COLUMNS]],
-            ignore_index=True,
-        )
-        combined_pdf = combined_pdf.sort_values(["interval_start", "timestamp"])
-        combined_pdf = combined_pdf.drop_duplicates(
-            subset=["symbol", "interval_start"],
-            keep="last",
-        )
-        combined_pdf = compute_features(combined_pdf)
+    feature_window = Window.partitionBy("symbol").orderBy("interval_start", "timestamp")
+    rolling_window_60 = feature_window.rowsBetween(-59, 0)
+    rolling_window_5 = feature_window.rowsBetween(-4, 0)
+    rolling_window_22 = feature_window.rowsBetween(-21, 0)
 
-        current_intervals = symbol_batch["interval_start"].unique()
-        current_rows = combined_pdf[combined_pdf["interval_start"].isin(current_intervals)].copy()
-        current_rows = apply_model(current_rows, symbol)
-        current_rows["risk_signal"] = current_rows["predicted_volatility_60min"].apply(label_risk)
-        prediction_timestamp = pd.Timestamp.now(tz="UTC")
-        current_rows["prediction_timestamp"] = prediction_timestamp.isoformat()
-        current_rows["market_timestamp"] = current_rows["timestamp"]
-        current_rows["current_volatility"] = current_rows["rolling_volatility_60"]
-        market_timestamps = pd.to_datetime(current_rows["market_timestamp"], utc=True, errors="coerce")
-        current_rows["latency_seconds"] = (prediction_timestamp - market_timestamps).dt.total_seconds()
+    combined_df = combined_df.withColumn("prev_close", lag("close", 1).over(feature_window))
 
-        output_frames.append(
-            current_rows[
-                [
-                    "prediction_timestamp",
-                    "market_timestamp",
-                    "symbol",
-                    "interval_start",
-                    "close",
-                    "volume",
-                    "predicted_volatility_60min",
-                    "current_volatility",
-                    "rolling_volatility_5",
-                    "rolling_volatility_22",
-                    "log_return",
-                    "roc",
-                    "latency_seconds",
-                    "risk_signal",
-                ]
-            ]
-        )
+    combined_df = combined_df.withColumn(
+        "log_return",
+        when(col("prev_close").isNotNull(), log(col("close") / col("prev_close"))).otherwise(None),
+    )
+    combined_df = combined_df.withColumn("realized_vol_60", stddev("log_return").over(rolling_window_60))
+    combined_df = combined_df.withColumn("realized_vol_5", stddev("log_return").over(rolling_window_5))
+    combined_df = combined_df.withColumn("realized_vol_22", stddev("log_return").over(rolling_window_22))
+    combined_df = combined_df.withColumn("lag_1_vol", lag("realized_vol_60", 1).over(feature_window))
+    combined_df = combined_df.withColumn("lag_5_vol", lag("realized_vol_60", 5).over(feature_window))
+    combined_df = combined_df.withColumn("volume_rolling_mean", avg("volume").over(rolling_window_5))
+    combined_df = combined_df.withColumn("lag_close_5", lag("close", 5).over(feature_window))
+    combined_df = combined_df.withColumn("lag_close_22", lag("close", 22).over(feature_window))
+    combined_df = combined_df.withColumn(
+        "roc_5",
+        when(
+            col("lag_close_5").isNotNull(),
+            (col("close") - col("lag_close_5")) / col("lag_close_5"),
+        ).otherwise(None),
+    )
+    combined_df = combined_df.withColumn(
+        "roc_22",
+        when(
+            col("lag_close_22").isNotNull(),
+            (col("close") - col("lag_close_22")) / col("lag_close_22"),
+        ).otherwise(None),
+    )
 
-        history_by_symbol[symbol] = combined_pdf[HISTORY_COLUMNS].tail(180).copy()
+    batch_df = combined_df.join(current_keys_df, on=["symbol", "interval_start"], how="inner")
 
-    if not output_frames:
-        print(f"Batch {batch_id}: no output rows")
-        return
+    batch_df = batch_df.withColumn(
+        "predicted_volatility_60min",
+        predict_volatility_udf(
+            col("symbol"),
+            col("realized_vol_5"),
+            col("realized_vol_22"),
+            col("realized_vol_60"),
+            col("lag_1_vol"),
+            col("lag_5_vol"),
+            col("volume_rolling_mean"),
+            col("roc_5"),
+            col("roc_22"),
+        ),
+    )
+    batch_df = batch_df.withColumn("prediction_timestamp", current_timestamp())
+    batch_df = batch_df.withColumn("market_timestamp", to_timestamp(col("timestamp")))
+    batch_df = batch_df.withColumn("current_volatility", col("realized_vol_60"))
+    batch_df = batch_df.withColumn("rolling_volatility_5", col("realized_vol_5"))
+    batch_df = batch_df.withColumn("rolling_volatility_22", col("realized_vol_22"))
+    batch_df = batch_df.withColumn("roc", col("roc_5"))
+    batch_df = batch_df.withColumn(
+        "latency_seconds",
+        when(
+            col("market_timestamp").isNotNull(),
+            col("prediction_timestamp").cast("double") - col("market_timestamp").cast("double"),
+        ).otherwise(None),
+    )
+    batch_df = batch_df.withColumn(
+        "risk_signal",
+        when(col("predicted_volatility_60min") > 0.02, "HIGH")
+        .when(col("predicted_volatility_60min") > 0.01, "MEDIUM")
+        .when(col("predicted_volatility_60min").isNotNull(), "LOW")
+        .otherwise(None),
+    )
 
-    output_pdf = pd.concat(output_frames, ignore_index=True)
-    output_pdf = output_pdf.where(pd.notnull(output_pdf), None)
+    output_df = batch_df.select(
+        col("prediction_timestamp").cast("string").alias("prediction_timestamp"),
+        col("market_timestamp").cast("string").alias("market_timestamp"),
+        "symbol",
+        "interval_start",
+        "close",
+        "volume",
+        "predicted_volatility_60min",
+        "current_volatility",
+        "rolling_volatility_5",
+        "rolling_volatility_22",
+        "log_return",
+        "roc",
+        "latency_seconds",
+        "risk_signal",
+    )
 
-    row_count = len(output_pdf.index)
-    prediction_count = int(output_pdf["predicted_volatility_60min"].notna().sum())
+    row_count = output_df.count()
+    prediction_count = output_df.filter(col("predicted_volatility_60min").isNotNull()).count()
     processing_time_ms = (time.time() - batch_start_time) * 1000.0
-    latency_values = pd.to_numeric(output_pdf["latency_seconds"], errors="coerce").dropna().tolist()
+    latency_values = [
+        row["latency_seconds"]
+        for row in output_df.select("latency_seconds").where(col("latency_seconds").isNotNull()).collect()
+    ]
+
     metrics.add_batch(row_count, prediction_count, processing_time_ms, latency_values)
     summary = metrics.summary()
 
@@ -338,16 +378,24 @@ def process_batch(batch_df, batch_id):
         f"processing_ms={processing_time_ms:.2f}, avg_latency_s={summary['avg_latency_seconds']:.2f}"
     )
     if row_count:
-        print(output_pdf.tail(min(5, row_count)).to_string(index=False))
+        output_df.show(min(5, row_count), truncate=False)
 
-    batch_df.sparkSession.createDataFrame(output_pdf, schema=output_schema).write.mode("append").parquet(
-        OUTPUT_PATH
+    output_df.write.mode("append").parquet(OUTPUT_PATH)
+
+    history_tail_window = Window.partitionBy("symbol").orderBy(desc("interval_start"))
+    history_df = (
+        combined_df.select(*input_schema.fieldNames())
+        .withColumn("history_rank", row_number().over(history_tail_window))
+        .where(col("history_rank") <= 180)
+        .drop("history_rank")
     )
+    history_df.write.mode("overwrite").parquet(HISTORY_PATH)
 
     metrics_pdf = pd.DataFrame(
         [
             {
                 "batch_id": int(batch_id),
+                "timestamp": pd.Timestamp.now("UTC").isoformat(),
                 "runtime_seconds": summary["runtime_seconds"],
                 "total_messages": summary["total_messages"],
                 "total_predictions": summary["total_predictions"],
@@ -367,7 +415,7 @@ query = (
     .outputMode("append")
     .option("checkpointLocation", CHECKPOINT_PATH)
     .foreachBatch(process_batch)
-    .trigger(processingTime="10 seconds")
+    .trigger(processingTime="1 minutes")
     .start()
 )
 
